@@ -12,10 +12,12 @@ from pathlib import Path
 CST = timezone(timedelta(hours=8))
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR.parent / "data"
-ACCOUNT_FILE = DATA_DIR / "trend_account.json"
+sys.path.insert(0, str(SCRIPT_DIR))
+from account_manager import get_account_file, ensure_migrated, resolve_account_id  # noqa: E402
 
 def load_account():
-    with open(ACCOUNT_FILE) as f:
+    ensure_migrated()
+    with open(get_account_file(), encoding="utf-8") as f:
         return json.load(f)
 
 def run_script(script, args=None):
@@ -30,6 +32,71 @@ def run_script(script, args=None):
     except Exception as e:
         return -1, {"error": str(e)}
 
+
+def _quote_item(data, fallback_name):
+    if not isinstance(data, dict) or data.get("error"):
+        return None
+    price = float(data.get("price") or 0)
+    if price <= 0:
+        return None
+    return {
+        "name": data.get("name") or fallback_name,
+        "price": price,
+        "change_pct": float(data.get("change_pct") or 0),
+        "unit": "",
+    }
+
+
+def fetch_usdjpy():
+    """新浪即期：美元兑日元。失败返回 None。"""
+    url = "https://hq.sinajs.cn/list=fx_susdjpy"
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--connect-timeout", "8", "-H", "Referer: https://finance.sina.com.cn/", url],
+            capture_output=True, timeout=12,
+        )
+        text = r.stdout.decode("gbk", errors="ignore")
+        if "hq_str_fx_susdjpy=" not in text:
+            return None
+        raw = text.split('hq_str_fx_susdjpy="', 1)[1].split('"', 1)[0]
+        fields = raw.split(",")
+        if len(fields) < 12:
+            return None
+        price = float(fields[1] or 0)
+        pre_close = float(fields[3] or 0)
+        if price <= 0:
+            return None
+        # 优先用昨收算涨跌幅；否则用接口自带百分比字段
+        if pre_close > 0:
+            change_pct = (price - pre_close) / pre_close * 100
+        else:
+            change_pct = float(fields[10] or 0)
+        return {
+            "name": "美元兑日元",
+            "price": price,
+            "change_pct": round(change_pct, 2),
+            "unit": "",
+        }
+    except Exception:
+        return None
+
+
+def fetch_market_quotes():
+    """上证 / 科创50 / 美元兑日元。"""
+    quotes = []
+    _, sh = run_script("get_price.py", ["sh000001"])
+    item = _quote_item(sh, "上证指数")
+    if item:
+        quotes.append(item)
+    _, star = run_script("get_price.py", ["sh000688"])
+    item = _quote_item(star, "科创50")
+    if item:
+        quotes.append(item)
+    fx = fetch_usdjpy()
+    if fx:
+        quotes.append(fx)
+    return quotes
+
 def fetch_prices(positions):
     if not positions:
         return {}
@@ -38,11 +105,18 @@ def fetch_prices(positions):
         prefix = "sh" if c.startswith("6") else "sz"
         market_codes.append(f"{prefix}{c}")
     rc, data = run_script("batch_query.py", market_codes)
-    if rc != 0 or isinstance(data, str):
+    if isinstance(data, dict) and "data" in data and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not isinstance(data, dict):
+        return {}
+    if rc not in (0, 2) and not data:
         return {}
     result = {}
     for k, v in data.items():
-        pure_code = k.lstrip("shszSHSZ")
+        if k in ("errors", "error", "warning") or not isinstance(v, dict):
+            continue
+        key = str(k)
+        pure_code = key[2:] if key.startswith(("sh", "sz", "SH", "SZ")) else key
         if pure_code in positions:
             result[pure_code] = v
     return result
@@ -278,7 +352,7 @@ def generate_report():
 
     # 获取收盘行情
     prices = fetch_prices(acc["positions"])
-    rc, index_data = run_script("get_price.py", ["sh000001"])
+    market_quotes = fetch_market_quotes()
 
     # 执行 snapshot
     run_script("simulate_trend.py", ["snapshot"])
@@ -373,15 +447,6 @@ def generate_report():
     total_return = total_assets - acc["initial_cash"]
     total_return_pct = total_return / acc["initial_cash"] * 100
 
-    # 指数数据
-    index_info = {}
-    if index_data and isinstance(index_data, dict):
-        index_info = {
-            "name": index_data.get("name", "上证指数"),
-            "price": index_data.get("price", 0),
-            "change_pct": index_data.get("change_pct", 0),
-        }
-
     # 指标计算
     snapshots = acc.get("daily_snapshots", [])
     sharpe = calc_sharpe(snapshots)
@@ -423,12 +488,18 @@ def generate_report():
         lines.append(f"| 冻结状态 | 🔒 至 {acc['frozen_until']} |")
     lines.append(f"")
 
-    # 指数
-    if index_info:
+    # 大盘 / 汇率
+    if market_quotes:
         lines.append(f"## 大盘行情")
         lines.append(f"")
-        idx_emoji = "📈" if index_info["change_pct"] >= 0 else "📉"
-        lines.append(f"- {idx_emoji} {index_info.get('name', '上证指数')}: **{index_info['price']}** ({index_info['change_pct']:+.2f}%)")
+        for q in market_quotes:
+            emoji = "📈" if q["change_pct"] >= 0 else "📉"
+            price = q["price"]
+            if "日元" in q["name"] or "汇率" in q["name"]:
+                price_s = f"{price:.3f}"
+            else:
+                price_s = f"{price:.2f}"
+            lines.append(f"- {emoji} {q['name']}: **{price_s}** ({q['change_pct']:+.2f}%)")
         lines.append(f"")
 
     # 持仓明细 + 健康度
@@ -626,6 +697,19 @@ def generate_report():
     lines.append(f"## 市场环境")
     lines.append(f"")
     lines.append(f"- 当前状态: **{regime.get('current', 'unknown')}**")
+    if regime.get("leader_style_cn"):
+        conf = regime.get("leader_style_confidence")
+        conf_s = f"（{conf}%）" if conf is not None else ""
+        lines.append(f"- 龙头风格: **{regime.get('leader_style_cn')}**{conf_s}")
+        if regime.get("style_reason"):
+            lines.append(f"- 风格依据: {regime.get('style_reason')}")
+        leaders = regime.get("leaders") or []
+        if leaders:
+            names = "、".join(
+                f"{x.get('name')}({x.get('code')}) {x.get('lianban')}板"
+                for x in leaders[:5]
+            )
+            lines.append(f"- 领涨龙头: {names}")
     params = regime.get("params_active", {})
     if params:
         lines.append(f"- 止损线: {params.get('stop_loss', 0)*100:.1f}%")
@@ -717,13 +801,24 @@ def generate_report():
 
     report_text = "\n".join(lines)
 
-    # 保存到文件
-    report_file = DATA_DIR / f"trend_report_{today}.md"
-    with open(report_file, "w") as f:
+    # 保存到文件（按账户区分）
+    try:
+        aid = resolve_account_id()
+    except ValueError:
+        aid = "default"
+    report_file = DATA_DIR / f"trend_report_{today}_{aid}.md"
+    with open(report_file, "w", encoding="utf-8") as f:
         f.write(report_text)
+    # 兼容旧路径：单账户时额外写一份无后缀文件
+    legacy = DATA_DIR / f"trend_report_{today}.md"
+    acct_files = list((DATA_DIR / "accounts").glob("*.json")) if (DATA_DIR / "accounts").exists() else []
+    if aid == "default" or len(acct_files) <= 1:
+        with open(legacy, "w", encoding="utf-8") as f:
+            f.write(report_text)
 
     return {
         "status": "ok",
+        "account_id": aid,
         "report_file": str(report_file),
         "report": report_text,
         "need_email": True,
@@ -731,7 +826,16 @@ def generate_report():
 
 
 if __name__ == "__main__":
-    result = generate_report()
+    if "--account" in sys.argv:
+        idx = sys.argv.index("--account")
+        if idx + 1 < len(sys.argv):
+            from account_manager import set_account_context
+            set_account_context(sys.argv[idx + 1])
+    try:
+        result = generate_report()
+    except Exception as e:
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        sys.exit(1)
     if "error" in result:
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(1)

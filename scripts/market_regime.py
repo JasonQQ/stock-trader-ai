@@ -5,37 +5,106 @@ Market Regime 分类器 v2
 输出：bull / range / bear + 置信度 + 参数库
 新增：ATR 动态止损参数、涨幅窗口 1-9.5%
 """
-import json, sys, subprocess, re, math
+import json, os, sys, subprocess, re, math, time
 from datetime import datetime, timezone, timedelta
 
 CST = timezone(timedelta(hours=8))
+_CURL_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+
+def _direct_env():
+    """行情接口直连。Cursor/Streamlit 会注入 HTTP_PROXY，curl 走代理后常返回空。"""
+    env = os.environ.copy()
+    for key in list(env):
+        if key.lower() in ("http_proxy", "https_proxy", "all_proxy", "ftp_proxy"):
+            env.pop(key, None)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return env
+
 
 # === 数据获取 ===
+def _curl(url, timeout=15):
+    r = subprocess.run(
+        [
+            "curl", "-s", "--noproxy", "*", "--connect-timeout", "10",
+            "-A", _CURL_UA,
+            "-H", "Referer: https://finance.qq.com/",
+            url,
+        ],
+        capture_output=True, timeout=timeout, env=_direct_env(),
+    )
+    return (r.stdout or b"").decode("utf-8", errors="ignore").strip()
+
+
+def _parse_tencent_kline(raw, code):
+    if not raw:
+        return []
+    data = json.loads(raw)
+    klines = (data.get("data") or {}).get(code) or {}
+    return klines.get("qfqday") or klines.get("day") or klines.get("qfq") or []
+
+
+def _parse_sina_kline(raw):
+    """新浪: {day,open,high,low,close,volume} → 腾讯行 [date,open,close,high,low,volume]"""
+    if not raw:
+        return []
+    items = json.loads(raw)
+    if not isinstance(items, list):
+        return []
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        rows.append([
+            it.get("day") or it.get("date") or "",
+            str(it.get("open") or 0),
+            str(it.get("close") or 0),
+            str(it.get("high") or 0),
+            str(it.get("low") or 0),
+            str(it.get("volume") or 0),
+        ])
+    return rows
+
+
 def get_kline(code="sh000001", days=120, max_retries=3):
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
+    urls = [
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq",
+        f"https://web.ifzq.gtimg.cn/appstock/app/kline/get?param={code},day,,,{days},qfq",
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},",
+    ]
+    sina = (
+        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={days}"
+    )
+    last_err = None
     for attempt in range(max_retries):
         try:
-            r = subprocess.run(["curl", "-s", "--connect-timeout", "10", url],
-                               capture_output=True, timeout=15)
-            data = json.loads(r.stdout.decode("utf-8"))
-            klines = data.get("data", {}).get(code, {})
-            rows = klines.get("qfqday") or klines.get("day", [])
+            for url in urls:
+                rows = _parse_tencent_kline(_curl(url), code)
+                if rows:
+                    return rows
+            rows = _parse_sina_kline(_curl(sina, timeout=15))
             if rows:
                 return rows
-        except Exception:
-            pass
+        except Exception as e:
+            last_err = e
         if attempt < max_retries - 1:
-            import time
             time.sleep(1 * (attempt + 1))
-    raise RuntimeError(f"No kline data for {code} after {max_retries} retries")
+    raise RuntimeError(
+        f"No kline data for {code} after {max_retries} retries"
+        + (f" ({last_err})" if last_err else "")
+    )
 
 def curl_with_retry(args, max_retries=3, timeout=15):
     """带重试的 curl 封装"""
     import time
     for attempt in range(max_retries):
         try:
-            r = subprocess.run(["curl", "-s"] + args,
-                               capture_output=True, timeout=timeout)
+            r = subprocess.run(
+                ["curl", "-s", "--noproxy", "*", "-A", _CURL_UA] + args,
+                capture_output=True, timeout=timeout, env=_direct_env(),
+            )
             return r.stdout.decode("utf-8", errors="ignore").strip()
         except Exception:
             if attempt < max_retries - 1:
@@ -90,10 +159,211 @@ def get_emotion_data():
         return {
             "up": up, "down": down,
             "limit_up": limit_up, "limit_down": limit_down,
-            "total_amount": total_amount, "total": total
+            "total_amount": total_amount, "total": total,
+            "top_items": top_items[:40],
         }
     except Exception:
         return None
+
+
+def get_kline_once(code, days=16):
+    """单次拉取日K，供风格判定（不做三重重试）。"""
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
+    try:
+        rows = _parse_tencent_kline(_curl(url), code)
+        if rows:
+            return rows
+    except Exception:
+        pass
+    return []
+
+
+def _to_market_code(code):
+    c = str(code).lstrip("shszSHSZ")
+    return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
+
+
+def _limit_threshold(code, name):
+    if "ST" in (name or "").upper():
+        return 0.047
+    c = str(code).lstrip("shszSHSZ")
+    if c.startswith(("300", "301", "688")):
+        return 0.195
+    return 0.095
+
+
+def count_lianban(rows, code, name):
+    """从最近一根K往回数连续涨停天数。"""
+    if not rows or len(rows) < 2:
+        return 0
+    limit = _limit_threshold(code, name)
+    n = 0
+    for i in range(len(rows) - 1, 0, -1):
+        prev = float(rows[i - 1][2])
+        close = float(rows[i][2])
+        if prev <= 0:
+            break
+        if (close - prev) / prev >= limit - 0.003:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _index_change(code, days=21):
+    rows = get_kline_once(code, days + 5)
+    closes = [float(r[2]) for r in rows if len(r) > 2]
+    if len(closes) < days:
+        return None
+    return round((closes[-1] - closes[-days]) / closes[-days] * 100, 2)
+
+
+def _skip_leader_candidate(code, name, change_pct):
+    name = name or ""
+    code = str(code).lstrip("shszSHSZ")
+    if name.startswith(("N", "C")):
+        return True
+    if "ST" in name.upper():
+        return True
+    if code.startswith(("8", "4", "92")):
+        return True
+    if change_pct > 44:
+        return True
+    return False
+
+
+def classify_leader_style(top_items=None, adx=0):
+    """领涨龙头风格：趋势 / 小盘连板 / 分化。"""
+    items = list(top_items or [])
+    analyzed = []
+    for it in items:
+        if len(analyzed) >= 12:
+            break
+        code = str(it.get("code") or "")
+        name = it.get("name") or code
+        try:
+            chg = float(it.get("changepercent") or 0)
+        except (TypeError, ValueError):
+            chg = 0.0
+        if _skip_leader_candidate(code, name, chg):
+            continue
+        rows = get_kline_once(_to_market_code(code), 16)
+        lianban = count_lianban(rows, code, name)
+        try:
+            nmc = float(it.get("nmc") or 0) / 10000.0  # 万元 → 亿
+        except (TypeError, ValueError):
+            nmc = 0.0
+        try:
+            turnover = float(it.get("turnoverratio") or 0)
+            amount = float(it.get("amount") or 0) / 1e8
+        except (TypeError, ValueError):
+            turnover, amount = 0.0, 0.0
+        analyzed.append({
+            "code": code,
+            "name": name,
+            "change_pct": round(chg, 2),
+            "lianban": lianban,
+            "float_cap_yi": round(nmc, 1),
+            "turnover": round(turnover, 2),
+            "amount_yi": round(amount, 2),
+        })
+
+    hs300 = _index_change("sh000300")
+    csi1000 = _index_change("sh000852")
+    gem = _index_change("sz399006")
+    small_rs = None
+    if hs300 is not None and csi1000 is not None:
+        small_rs = round(csi1000 - hs300, 2)
+
+    board_pts = 0
+    trend_pts = 0
+    max_lb = max((x["lianban"] for x in analyzed), default=0)
+    n_lb2 = sum(1 for x in analyzed if x["lianban"] >= 2)
+    n_lb3 = sum(1 for x in analyzed if x["lianban"] >= 3)
+    zt = [x for x in analyzed if x["change_pct"] >= 9.5 or x["lianban"] >= 1]
+    small_zt = [x for x in zt if 0 < x["float_cap_yi"] < 80]
+    small_share = (len(small_zt) / len(zt)) if zt else 0
+    caps = [x["float_cap_yi"] for x in analyzed if x["float_cap_yi"] > 0]
+    caps_sorted = sorted(caps)
+    median_cap = caps_sorted[len(caps_sorted) // 2] if caps_sorted else None
+    mid_trend_leaders = [
+        x for x in analyzed
+        if x["float_cap_yi"] >= 200 and 2 <= x["change_pct"] < 9.5 and x["lianban"] <= 1
+    ]
+
+    if max_lb >= 5:
+        board_pts += 3
+    elif max_lb >= 3:
+        board_pts += 2
+    elif max_lb >= 2:
+        board_pts += 1
+    if n_lb3 >= 2:
+        board_pts += 2
+    elif n_lb2 >= 3:
+        board_pts += 1
+    if zt and small_share >= 0.6:
+        board_pts += 2
+    if median_cap is not None and median_cap < 50:
+        board_pts += 1
+    if small_rs is not None and small_rs >= 3:
+        board_pts += 1
+
+    if max_lb <= 1:
+        trend_pts += 2
+    if mid_trend_leaders:
+        trend_pts += 2
+    if median_cap is not None and median_cap >= 150:
+        trend_pts += 1
+    if small_rs is not None and small_rs <= -1:
+        trend_pts += 1
+    if adx >= 25:
+        trend_pts += 1
+
+    if board_pts >= trend_pts + 2:
+        style, style_cn = "consecutive_board", "小盘连板"
+        conf = min(100, 55 + (board_pts - trend_pts) * 12)
+    elif trend_pts >= board_pts + 2:
+        style, style_cn = "trend", "趋势"
+        conf = min(100, 55 + (trend_pts - board_pts) * 12)
+    else:
+        style, style_cn = "mixed", "分化"
+        conf = max(40, 70 - abs(board_pts - trend_pts) * 8)
+
+    leaders = sorted(
+        analyzed,
+        key=lambda x: (x["lianban"], x["change_pct"], x["amount_yi"]),
+        reverse=True,
+    )[:5]
+    reason_bits = [
+        f"最高连板{max_lb}天",
+        f"2板及以上{n_lb2}只",
+        f"涨停中小盘占比{small_share:.0%}" if zt else "近端无有效涨停样本",
+    ]
+    if small_rs is not None:
+        reason_bits.append(f"中证1000相对沪深300 {small_rs:+.1f}%")
+    if median_cap is not None:
+        reason_bits.append(f"领涨流通市值中位数{median_cap:.0f}亿")
+
+    return {
+        "leader_style": style,
+        "leader_style_cn": style_cn,
+        "leader_style_confidence": round(conf, 1),
+        "board_score": board_pts,
+        "trend_score": trend_pts,
+        "leaders": leaders,
+        "style_reason": "；".join(reason_bits),
+        "style_metrics": {
+            "max_lianban": max_lb,
+            "lianban_ge2": n_lb2,
+            "lianban_ge3": n_lb3,
+            "zt_small_share": round(small_share, 2),
+            "median_float_cap_yi": round(median_cap, 1) if median_cap is not None else None,
+            "hs300_20d": hs300,
+            "csi1000_20d": csi1000,
+            "gem_20d": gem,
+            "small_vs_large_20d": small_rs,
+        },
+    }
 
 # === 技术指标 ===
 def calc_ma(closes, period):
@@ -324,6 +594,15 @@ def classify_regime():
     elif strong_trend:
         params[regime]["atr_multiplier"] = 1.6
 
+    style_info = classify_leader_style(
+        (emotion or {}).get("top_items") if emotion else None,
+        adx=adx,
+    )
+    # 小盘连板：不追高度板，涨幅上限收紧
+    if style_info.get("leader_style") == "consecutive_board":
+        params[regime]["max_change"] = min(float(params[regime].get("max_change") or 9.5), 7.0)
+        params[regime]["min_change"] = max(float(params[regime].get("min_change") or 1), 1.5)
+
     return {
         "regime": regime,
         "strong_trend": strong_trend,
@@ -331,6 +610,14 @@ def classify_regime():
         "bull_score": bull_score,
         "bear_score": bear_score,
         "emotion_adj": emotion_adj,
+        "leader_style": style_info.get("leader_style"),
+        "leader_style_cn": style_info.get("leader_style_cn"),
+        "leader_style_confidence": style_info.get("leader_style_confidence"),
+        "board_score": style_info.get("board_score"),
+        "trend_score": style_info.get("trend_score"),
+        "leaders": style_info.get("leaders") or [],
+        "style_reason": style_info.get("style_reason"),
+        "style_metrics": style_info.get("style_metrics") or {},
         "technicals": {
             "ma5": round(ma5, 2) if ma5 else None,
             "ma10": round(ma10, 2) if ma10 else None,
@@ -356,5 +643,5 @@ if __name__ == "__main__":
         result = classify_regime()
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except Exception as e:
-        print(json.dumps({"error": str(e)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
         sys.exit(1)

@@ -1,12 +1,12 @@
 {
   "weights": {
-    "change_pct": 25,
-    "volume_ratio": 20,
-    "ma_aligned": 20,
-    "macd_signal": 15,
-    "turnover": 10,
-    "amount": 10,
-    "relative_strength": 20
+    "change_pct": 25.0,
+    "volume_ratio": 20.0,
+    "ma_aligned": 20.0,
+    "macd_signal": 15.0,
+    "turnover": 10.0,
+    "amount": 10.0,
+    "relative_strength": 20.0
   },
   "initial_weights": {
     "change_pct": 25,
@@ -26,6 +26,7 @@
   "min_correlation": 0.3,
   "adjustment_step": 2,
   "evaluation_period": "monthly",
-  "last_updated": "2026-04-28",
-  "notes": "v3.3: 新增增强因子模块(akshare_data.py)，27个技术因子叠加到基础评分(±25分×0.4系数)。包含：KDJ/布林带/OBV/多周期RSI/量价背离/波动率结构/CCI/威廉指标/支撑阻力距离/动量加速度/相对强弱。数据源：腾讯K线+新浪实时行情。"
+  "last_updated": "2026-09-18",
+  "notes": "v3.3: 新增增强因子模块(akshare_data.py)，27个技术因子叠加到基础评分(±25分×0.4系数)。包含：KDJ/布林带/OBV/多周期RSI/量价背离/波动率结构/CCI/威廉指标/支撑阻力距离/动量加速度/相对强弱。数据源：腾讯K线+新浪实时行情。",
+  "last_optimize": "2026-09-18T16:05:00.276754+08:00"
 }

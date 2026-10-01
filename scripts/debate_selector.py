@@ -133,10 +133,11 @@ DEBATE_PROMPT = """
 # ============================================================
 
 def load_account():
-    """加载账户数据"""
-    path = os.path.join(DATA_DIR, 'trend_account.json')
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    """加载账户数据（STOCK_ACCOUNT_ID / 唯一账户）"""
+    sys.path.insert(0, os.path.dirname(__file__))
+    from account_manager import load_account_data, ensure_migrated
+    ensure_migrated()
+    return load_account_data()
 
 
 def build_candidate_details(candidates_json):

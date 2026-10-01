@@ -12,7 +12,43 @@ from pathlib import Path
 CST = timezone(timedelta(hours=8))
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR.parent / "data"
-ACCOUNT_FILE = DATA_DIR / "trend_account.json"
+sys.path.insert(0, str(SCRIPT_DIR))
+from account_manager import (  # noqa: E402
+    get_account_file,
+    resolve_account_id,
+    set_account_context,
+    ensure_migrated,
+    create_account as am_create_account,
+    delete_account as am_delete_account,
+    list_accounts as am_list_accounts,
+    status_payload as am_status_payload,
+    sync_legacy,
+)
+
+def _account_file():
+    """当前上下文账户文件（由 --account / STOCK_ACCOUNT_ID 指定）。"""
+    ensure_migrated()
+    return get_account_file()
+
+
+def _current_account_id() -> str:
+    return resolve_account_id()
+
+# 兼容旧代码中的 ACCOUNT_FILE 引用（动态属性）
+class _AccountFileProxy:
+    @property
+    def path(self):
+        return _account_file()
+    def __fspath__(self):
+        return str(_account_file())
+    def exists(self):
+        return _account_file().exists()
+    def with_suffix(self, suffix):
+        return _account_file().with_suffix(suffix)
+    def __str__(self):
+        return str(_account_file())
+
+ACCOUNT_FILE = _AccountFileProxy()
 
 # === A股规则配置 ===
 
@@ -140,27 +176,32 @@ def calc_fees(amount, is_sell=False, stock_type="stock"):
     return round(commission + transfer + stamp, 2)
 
 def load_account():
-    if not ACCOUNT_FILE.exists():
+    path = _account_file()
+    if not path.exists():
         return None
-    with open(ACCOUNT_FILE) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 def save_account(acc):
     import fcntl
+    ensure_migrated()
+    path = _account_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.now(CST).strftime("%Y-%m-%d")
-    backup = DATA_DIR / f"trend_account_{today}.json"
-    if ACCOUNT_FILE.exists() and not backup.exists():
-        shutil.copy2(ACCOUNT_FILE, backup)
+    aid = _current_account_id()
+    backup = DATA_DIR / "accounts" / f"{aid}_{today}.json"
+    if path.exists() and not backup.exists():
+        shutil.copy2(path, backup)
     # 原子写入：写临时文件再 rename，避免并发读到半写状态
-    tmp_file = ACCOUNT_FILE.with_suffix(".tmp")
-    lock_file = ACCOUNT_FILE.with_suffix(".lock")
+    tmp_file = path.with_suffix(".tmp")
+    lock_file = path.with_suffix(".lock")
     try:
         with open(lock_file, "w") as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)  # 排他锁
-            with open(tmp_file, "w") as f:
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(acc, f, ensure_ascii=False, indent=2)
-            tmp_file.rename(ACCOUNT_FILE)  # 原子操作
+            tmp_file.rename(path)  # 原子操作
             fcntl.flock(lf, fcntl.LOCK_UN)
     finally:
         if lock_file.exists():
@@ -168,6 +209,7 @@ def save_account(acc):
                 lock_file.unlink()
             except Exception:
                 pass
+    sync_legacy(aid)
 
 def calc_total_assets(acc, current_prices=None):
     total = acc["current_cash"]
@@ -175,6 +217,123 @@ def calc_total_assets(acc, current_prices=None):
         price = current_prices.get(code, pos["avg_price"]) if current_prices else pos["avg_price"]
         total += pos["shares"] * price
     return round(total, 2)
+
+
+def fetch_live_quote(code) -> dict:
+    """单只实时行情（含昨收）。失败返回空 dict。"""
+    code = str(code)
+    prefix = "sh" if code.startswith("6") else "sz"
+    try:
+        r = subprocess.run(
+            [sys.executable or "python3", str(SCRIPT_DIR / "batch_query.py"), f"{prefix}{code}"],
+            capture_output=True, timeout=20,
+        )
+        raw = (r.stdout or b"").decode("utf-8", errors="ignore").strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        if isinstance(data, dict) and "data" in data and isinstance(data.get("data"), dict):
+            data = data.get("data") or {}
+        for k, v in (data or {}).items():
+            if k in ("errors", "error", "warning") or not isinstance(v, dict):
+                continue
+            return {
+                "price": float(v.get("price") or 0),
+                "pre_close": float(v.get("pre_close") or 0),
+                "name": v.get("name") or "",
+            }
+    except Exception:
+        return {}
+    return {}
+
+
+def fetch_live_prices(positions) -> dict:
+    """批量拉取持仓现价，返回 {纯代码: 现价}；失败时返回空 dict。
+
+    batch_query 部分校验失败时仍会输出 {errors, data}（exit 2），此处取 data 中的有效现价。
+    """
+    if not positions:
+        return {}
+    pos_keys = {str(c) for c in positions}
+    market_codes = []
+    for code in pos_keys:
+        prefix = "sh" if code.startswith("6") else "sz"
+        market_codes.append(f"{prefix}{code}")
+    try:
+        r = subprocess.run(
+            [sys.executable or "python3", str(SCRIPT_DIR / "batch_query.py"), *market_codes],
+            capture_output=True, timeout=30,
+        )
+        raw = (r.stdout or b"").decode("utf-8", errors="ignore").strip()
+        if not raw:
+            return {}
+        price_data = json.loads(raw)
+        # 校验失败时结构为 {errors, data}；成功时为 {sh600000: {...}, ...}
+        if isinstance(price_data, dict) and "data" in price_data and isinstance(price_data.get("data"), dict):
+            price_data = price_data.get("data") or {}
+        prices = {}
+        for k, v in (price_data or {}).items():
+            if k in ("errors", "error", "warning") or not isinstance(v, dict):
+                continue
+            key = str(k)
+            if key.startswith(("sh", "sz", "SH", "SZ")):
+                pure = key[2:]
+            else:
+                pure = key
+            px = float(v.get("price") or 0)
+            if pure in pos_keys and px > 0:
+                prices[pure] = px
+        return prices
+    except Exception:
+        return {}
+
+
+def mark_to_market(acc, current_prices=None):
+    """按现价计算总资产/收益/回撤及持仓浮盈。不写盘。"""
+    prices = current_prices if current_prices is not None else fetch_live_prices(acc.get("positions") or {})
+    live = bool(prices)
+    positions_mtm = {}
+    market_value = 0.0
+    for code, pos in (acc.get("positions") or {}).items():
+        avg = float(pos.get("avg_price") or 0)
+        shares = int(pos.get("shares") or 0)
+        last = float(prices.get(code, avg) or avg)
+        mv = shares * last
+        cost = shares * avg
+        pnl = mv - cost
+        pnl_pct = (last - avg) / avg * 100 if avg > 0 else 0
+        market_value += mv
+        positions_mtm[code] = {
+            **pos,
+            "last_price": round(last, 3),
+            "market_value": round(mv, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "priced_live": code in prices,
+        }
+    cash = float(acc.get("current_cash") or 0)
+    total_assets = round(cash + market_value, 2)
+    initial = float(acc.get("initial_cash") or 0)
+    total_return = round(total_assets - initial, 2)
+    total_return_pct = round(total_return / initial * 100, 2) if initial else 0
+    peak = float(acc.get("peak_total_assets") or initial or 0)
+    # 展示用峰值：若市值创新高则抬升，避免收益已涨回撤仍按旧峰值失真
+    peak_display = max(peak, total_assets)
+    drawdown_pct = round((peak_display - total_assets) / peak_display * 100, 2) if peak_display > 0 else 0
+    return {
+        "total_assets": total_assets,
+        "market_value": round(market_value, 2),
+        "current_cash": round(cash, 2),
+        "initial_cash": initial,
+        "total_return": total_return,
+        "total_return_pct": total_return_pct,
+        "peak_total_assets": peak,
+        "peak_display": peak_display,
+        "drawdown_pct": drawdown_pct,
+        "positions_mtm": positions_mtm,
+        "live_prices": prices,
+        "priced_live": live,
+    }
 
 # === 新增：ATR 计算 ===
 def calc_atr(code, period=20):
@@ -232,12 +391,15 @@ def calc_dynamic_stop_loss(code, buy_price, atr_multiplier=1.5):
     return None, None
 
 # === 新增：回撤熔断检查 ===
-def check_drawdown_circuit_breaker(acc):
-    """检查是否触发组合级回撤熔断，返回 (triggered, drawdown_pct)"""
+def check_drawdown_circuit_breaker(acc, current_prices=None):
+    """检查是否触发组合级回撤熔断，返回 (triggered, drawdown_pct)。优先用实时价。"""
     peak = acc.get("peak_total_assets", acc["initial_cash"])
     if peak <= 0:
         return False, 0
-    total_assets = calc_total_assets(acc)
+    prices = current_prices if current_prices is not None else fetch_live_prices(acc.get("positions") or {})
+    total_assets = calc_total_assets(acc, prices if prices else None)
+    if total_assets > peak:
+        peak = total_assets
     drawdown = (peak - total_assets) / peak
     if drawdown >= DRAWDOWN_THRESHOLD:
         return True, round(drawdown, 4)
@@ -250,6 +412,27 @@ def is_frozen(acc):
         return False
     today = datetime.now(CST).strftime("%Y-%m-%d")
     return today <= frozen_until
+
+
+def freeze_end_date(n_days=DRAWDOWN_FREEZE_DAYS) -> str:
+    """从今天起算 N 个交易日后的冻结截止日期。"""
+    d = datetime.now(CST).date()
+    days_added = 0
+    while days_added < n_days:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            days_added += 1
+    return d.strftime("%Y-%m-%d")
+
+
+def arm_drawdown_freeze(acc) -> str:
+    """首次触发回撤熔断时写入冻结期；已冻结则保持原日期。"""
+    if is_frozen(acc) and acc.get("frozen_until"):
+        return acc["frozen_until"]
+    acc["frozen_until"] = freeze_end_date()
+    stats = acc.setdefault("stats", {})
+    stats["drawdown_circuit_breaks"] = stats.get("drawdown_circuit_breaks", 0) + 1
+    return acc["frozen_until"]
 
 # === 新增：移动止盈检查 ===
 def check_trailing_stop(pos, current_price):
@@ -290,16 +473,99 @@ def update_peak_assets(acc, total_assets):
 # === 命令实现 ===
 
 def cmd_init(args):
-    cash = float(args[0]) if args else 100000.0
-    acc = DEFAULT_ACCOUNT.copy()
+    """init [金额] [--id 账户ID] [--name 名称] [--new]
+    重置当前 --account 上下文账户；--new/--id 时创建新账户。
+    """
+    cash = 100000.0
+    account_id = None
+    name = None
+    as_new = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--id" and i + 1 < len(args):
+            account_id = args[i + 1]; i += 2
+        elif args[i] == "--name" and i + 1 < len(args):
+            name = args[i + 1]; i += 2
+        elif args[i] == "--new":
+            as_new = True; i += 1
+        else:
+            try:
+                cash = float(args[i])
+            except ValueError:
+                pass
+            i += 1
+
+    if as_new or account_id:
+        aid = account_id or f"acct_{datetime.now(CST).strftime('%H%M%S')}"
+        result = am_create_account(aid, name=name, cash=cash, overwrite=False)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    ensure_migrated()
+    if not am_list_accounts():
+        result = am_create_account("default", name=name or "默认账户", cash=cash)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    aid = _current_account_id()
+    acc = json.loads(json.dumps(DEFAULT_ACCOUNT))
     acc["initial_cash"] = cash
     acc["current_cash"] = cash
     acc["total_assets"] = cash
     acc["peak_total_assets"] = cash
     acc["frozen_until"] = None
     acc["created_at"] = datetime.now(CST).isoformat()
+    acc["account_id"] = aid
+    acc["account_name"] = name or acc.get("account_name") or aid
     save_account(acc)
-    print(json.dumps({"status": "ok", "cash": cash}, ensure_ascii=False))
+    print(json.dumps({"status": "ok", "cash": cash, "account_id": aid}, ensure_ascii=False))
+
+
+def cmd_account(args):
+    """account list|create|delete|status ..."""
+    if not args:
+        print(json.dumps(am_status_payload(), ensure_ascii=False, indent=2))
+        return
+    sub = args[0]
+    rest = args[1:]
+    try:
+        if sub in ("list", "status"):
+            print(json.dumps(am_status_payload(), ensure_ascii=False, indent=2))
+        elif sub == "create":
+            if not rest:
+                print(json.dumps({"error": "用法: account create <id> [--name 名称] [--cash 金额]"}, ensure_ascii=False))
+                sys.exit(1)
+            aid = rest[0]
+            name, cash = None, 100000.0
+            i = 1
+            while i < len(rest):
+                if rest[i] == "--name" and i + 1 < len(rest):
+                    name = rest[i + 1]; i += 2
+                elif rest[i] == "--cash" and i + 1 < len(rest):
+                    cash = float(rest[i + 1]); i += 2
+                elif rest[i] == "--no-switch":
+                    i += 1  # 兼容旧参数，忽略
+                else:
+                    i += 1
+            print(json.dumps(am_create_account(aid, name=name, cash=cash),
+                             ensure_ascii=False, indent=2))
+        elif sub == "delete":
+            if not rest:
+                print(json.dumps({"error": "用法: account delete <id>"}, ensure_ascii=False))
+                sys.exit(1)
+            print(json.dumps(am_delete_account(rest[0]), ensure_ascii=False, indent=2))
+        elif sub == "switch":
+            print(json.dumps({
+                "error": "已取消运行账户概念；请用 --account <id> 或 STOCK_ACCOUNT_ID 指定操作账户。"
+                         "Cron 会自动监控全部账户。"
+            }, ensure_ascii=False))
+            sys.exit(1)
+        else:
+            print(json.dumps({"error": f"未知子命令: {sub}"}, ensure_ascii=False))
+            sys.exit(1)
+    except ValueError as e:
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        sys.exit(1)
 
 def cmd_buy(args):
     """买入：buy <代码> <名称> <数量> <价格> [--reason <理由>] [--logic-stop <价格>] [--falsification <条件>] [--vote-score <分数>]"""
@@ -491,15 +757,23 @@ def cmd_sell(args):
         print(json.dumps({"error": f"T+1规则：{code} 今日买入，不可当日卖出！"}, ensure_ascii=False))
         sys.exit(1)
 
-    pre_close = pos.get("pre_close", pos["avg_price"])
+    # 涨跌停必须按昨收，不能用成本价。持仓无 pre_close 时（连跌后）会把成本当昨收，
+    # 把跌停价抬到成本×0.9，真实市价卖出被拒，止损永远成交不了。
+    quote = fetch_live_quote(code)
+    pre_close = (quote or {}).get("pre_close") or pos.get("pre_close")
     if pre_close:
         limit_up, limit_down, _ = calc_price_limit(code, pos["name"], pre_close)
         if price > limit_up:
             print(json.dumps({"error": f"卖出价 {price} 超过涨停价 {limit_up}"}, ensure_ascii=False))
             sys.exit(1)
         if price < limit_down:
-            print(json.dumps({"error": f"卖出价 {price} 低于跌停价 {limit_down}"}, ensure_ascii=False))
-            sys.exit(1)
+            live = (quote or {}).get("price") or query_price
+            # 滑点把成交价打穿跌停：按跌停价成交；现价本身低于跌停则拒单
+            if live + 1e-9 >= limit_down:
+                price = limit_down
+            else:
+                print(json.dumps({"error": f"卖出价 {price} 低于跌停价 {limit_down}"}, ensure_ascii=False))
+                sys.exit(1)
 
     board = pos.get("board", detect_board(code))
     lot_size = LOT_SIZES.get(board, 100)
@@ -576,26 +850,30 @@ def cmd_status(args):
     if not acc:
         print(json.dumps({"error": "账户未初始化"}, ensure_ascii=False))
         sys.exit(1)
-    total_market_value = sum(p["shares"] * p["avg_price"] for p in acc["positions"].values())
-    acc["total_assets"] = round(acc["current_cash"] + total_market_value, 2)
-    acc["total_return"] = round(acc["total_assets"] - acc["initial_cash"], 2)
-    acc["total_return_pct"] = round(acc["total_return"] / acc["initial_cash"] * 100, 2)
 
-    # 峰值回撤
-    peak = acc.get("peak_total_assets", acc["initial_cash"])
-    drawdown_pct = round((peak - acc["total_assets"]) / peak * 100, 2) if peak > 0 else 0
+    mtm = mark_to_market(acc)
+    # 回写实时总资产；市值创新高时更新峰值供熔断使用
+    if mtm["priced_live"]:
+        acc["total_assets"] = mtm["total_assets"]
+        if mtm["total_assets"] > float(acc.get("peak_total_assets") or 0):
+            acc["peak_total_assets"] = mtm["total_assets"]
+        save_account(acc)
 
     output = {
-        "initial_cash": acc["initial_cash"],
-        "current_cash": round(acc["current_cash"], 2),
-        "total_assets": acc["total_assets"],
-        "total_return": acc["total_return"],
-        "total_return_pct": f"{acc['total_return_pct']}%",
-        "peak_total_assets": peak,
-        "drawdown_from_peak": f"{drawdown_pct}%",
+        "account_id": _current_account_id(),
+        "account_name": acc.get("account_name") or _current_account_id(),
+        "initial_cash": mtm["initial_cash"],
+        "current_cash": mtm["current_cash"],
+        "market_value": mtm["market_value"],
+        "total_assets": mtm["total_assets"],
+        "total_return": mtm["total_return"],
+        "total_return_pct": f"{mtm['total_return_pct']}%",
+        "peak_total_assets": mtm["peak_display"],
+        "drawdown_from_peak": f"{mtm['drawdown_pct']}%",
+        "priced_live": mtm["priced_live"],
         "frozen_until": acc.get("frozen_until"),
         "positions_count": len(acc["positions"]),
-        "positions": acc["positions"],
+        "positions": mtm["positions_mtm"],
         "market_regime": acc["market_regime"],
         "stats": acc["stats"],
         "allowed_boards": list(ALLOWED_BOARDS),
@@ -703,27 +981,10 @@ def cmd_snapshot(args):
         sys.exit(1)
     today = datetime.now(CST).strftime("%Y-%m-%d")
 
-    # 获取实时价格计算真实总资产
-    current_prices = {}
-    if acc["positions"]:
-        market_codes = []
-        for code in acc["positions"]:
-            prefix = "sh" if code.startswith("6") else "sz"
-            market_codes.append(f"{prefix}{code}")
-        try:
-            r = subprocess.run(["python3", str(SCRIPT_DIR / "batch_query.py")] + market_codes,
-                               capture_output=True, timeout=30)
-            if r.returncode == 0:
-                price_data = json.loads(r.stdout.decode("utf-8"))
-                for k, v in price_data.items():
-                    pure_code = k.lstrip("shszSHSZ")
-                    if pure_code in acc["positions"]:
-                        current_prices[pure_code] = v.get("price", 0)
-        except Exception:
-            pass  # 获取失败时回退到成本价
-
-    total_assets = calc_total_assets(acc, current_prices)
+    current_prices = fetch_live_prices(acc.get("positions") or {})
+    total_assets = calc_total_assets(acc, current_prices if current_prices else None)
     update_peak_assets(acc, total_assets)
+    acc["total_assets"] = total_assets
     snapshot = {
         "date": today, "total_assets": total_assets,
         "cash": acc["current_cash"], "positions": len(acc["positions"]),
@@ -738,10 +999,11 @@ def cmd_snapshot(args):
 def cmd_reset(args):
     cash = float(args[0]) if args else 100000.0
     # 回滚机制：reset 前自动备份
-    if ACCOUNT_FILE.exists():
+    path = _account_file()
+    if path.exists():
         ts = datetime.now(CST).strftime("%Y%m%d_%H%M%S")
-        backup_file = DATA_DIR / f"trend_account_before_reset_{ts}.json"
-        shutil.copy2(ACCOUNT_FILE, backup_file)
+        backup_file = DATA_DIR / "accounts" / f"{_current_account_id()}_before_reset_{ts}.json"
+        shutil.copy2(path, backup_file)
         print(json.dumps({
             "backup": str(backup_file),
             "msg": f"已备份到 {backup_file.name}，如需恢复请手动还原"
@@ -814,10 +1076,40 @@ COMMANDS = {
     "update_regime": cmd_update_regime, "update_atr_stops": cmd_update_atr_stops,
     "snapshot": cmd_snapshot, "reset": cmd_reset, "rules": cmd_rules,
     "circuit_breaker_check": cmd_circuit_breaker_check,
+    "account": cmd_account,
 }
 
+def _extract_account_flag(argv: list[str]) -> tuple[str | None, list[str]]:
+    """解析全局 --account <id>，返回 (account_id, 剩余参数)。"""
+    account_id = None
+    out = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--account" and i + 1 < len(argv):
+            account_id = argv[i + 1]
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return account_id, out
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print(f"用法: simulate_trend.py <{'|'.join(COMMANDS.keys())}> [args...]")
+    account_id, argv = _extract_account_flag(sys.argv[1:])
+    if account_id:
+        try:
+            set_account_context(account_id)
+        except ValueError as e:
+            # create/init 前账户可能尚不存在
+            if not (argv and argv[0] in ("init", "account")):
+                print(json.dumps({"error": str(e)}, ensure_ascii=False))
+                sys.exit(1)
+            os.environ["STOCK_ACCOUNT_ID"] = account_id
+
+    if not argv or argv[0] not in COMMANDS:
+        print(
+            f"用法: simulate_trend.py [--account <id>] <{'|'.join(COMMANDS.keys())}> [args...]\n"
+            f"多账户时必须指定 --account；Cron 会遍历全部账户。"
+        )
         sys.exit(1)
-    COMMANDS[sys.argv[1]](sys.argv[2:])
+    COMMANDS[argv[0]](argv[1:])

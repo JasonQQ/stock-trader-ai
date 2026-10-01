@@ -86,9 +86,36 @@ python3 scripts/stock_screener.py --top 10 --json | \
 
 # 一键回测 — 看看策略表现
 python3 scripts/backtest.py --start 2026-01-05 --end 2026-03-31 --json
+
+# Web 控制台 — 按钮执行脚本，表格 + 资金曲线
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
 ```
 
 就这么简单。剩下的交给 Cron 自动调度。
+
+---
+
+## 🖥️ Web Dashboard
+
+浏览器里一键跑选股 / 评分 / 回测，结果直接出表格和曲线：
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+| 按钮 | 作用 |
+|------|------|
+| 量化选股 | 四层漏斗，展示候选表 + 板块排名 |
+| 选股 + 因子评分 | 选股后接 37 因子评分，含对比柱状图 |
+| 市场环境 / 板块轮动 | 牛熊震荡判断与行业涨幅 |
+| 策略回测 | 指标卡片 + 资金曲线 + 成交明细 |
+| 账户状态 / 日报 / 健康检查 | 持仓、Markdown 日报、系统自检 |
+
+侧边栏可调 Top N、最高股价、回测区间与初始资金。脚本仍通过 CLI 子进程调用，与终端行为一致。
 
 ---
 
@@ -304,6 +331,37 @@ python3 scripts/backtest.py --start 2026-01-05 --end 2026-03-31 --json
 
 > 📅 自动识别法定节假日（30天）和调休交易日（3天），非交易时段智能跳过。
 
+### 多账户
+
+Cron 会**同时监控全部账户**（盯盘/建仓/日报/健康检查逐账户执行）。页面切换账户只影响展示。
+
+```bash
+# 列出账户
+python3 scripts/simulate_trend.py account list
+
+# 新建账户（自动纳入 Cron 监控）
+python3 scripts/simulate_trend.py account create aggressive --name 激进盘 --cash 200000
+
+# 对指定账户操作（买卖/状态等）
+python3 scripts/simulate_trend.py --account aggressive status
+python3 scripts/simulate_trend.py --account aggressive buy 002475 立讯精密 500 64.50
+```
+
+### 安装系统 Cron
+
+```bash
+# 写入当前用户 crontab（与 README 调度表一致）
+python3 scripts/cron_runner.py --install-crontab
+
+# 查看调度状态
+python3 scripts/cron_runner.py --status
+
+# 卸载
+python3 scripts/cron_runner.py --uninstall-crontab
+```
+
+也可在 Web 控制台顶部「调度中心」一键安装 / 查看进度 / 手动触发。运行日志在 `logs/cron/`，状态在 `data/cron_status.json`。
+
 ---
 
 ## 🧪 回测引擎
@@ -346,6 +404,8 @@ stock-trader-ai/
 │   │
 │   ├── daily_report.py             #   📊 日报生成
 │   ├── health_check.py             #   🏥 健康检查
+│   ├── cron_runner.py              #   ⏱️ Cron 统一入口 / 安装卸载
+│   ├── weekly_optimize.py          #   🧬 周五因子权重回归
 │   ├── batch_query.py              #   📡 批量行情
 │   ├── get_price.py                #   📈 单股行情
 │   ├── get_news.py                 #   📰 财经新闻
@@ -357,6 +417,8 @@ stock-trader-ai/
 │   ├── scoring_weights.json        #   因子权重配置
 │   └── trading_calendar.json       #   交易日历（2026年）
 │
+├── logs/cron/                      # 📝 定时任务日志
+├── app.py                          # 🖥️ Web 控制台（含调度中心）
 ├── config/                         # ⚙️ 配置
 │   └── smtp.env.example            #   邮件配置模板
 │
@@ -395,7 +457,7 @@ stock-trader-ai/
 - [ ] **机器学习因子挖掘** — 用 XGBoost/LightGBM 自动发现新因子
 - [ ] **多策略并行** — 趋势跟踪 + 均值回归 + 事件驱动
 - [ ] **实盘对接** — 通过券商 API 接入真实交易
-- [ ] **Web Dashboard** — 实时监控面板（持仓/收益/风控状态）
+- [x] **Web Dashboard** — Streamlit 控制台（按钮跑脚本 / 选股表 / 资金曲线）
 - [ ] **社群信号共享** — 策略信号订阅 + 组合跟投
 
 ---

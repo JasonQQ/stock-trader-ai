@@ -12,20 +12,36 @@ from pathlib import Path
 CST = timezone(timedelta(hours=8))
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR.parent / "data"
-ACCOUNT_FILE = DATA_DIR / "trend_account.json"
+sys.path.insert(0, str(SCRIPT_DIR))
+from account_manager import get_account_file, ensure_migrated, resolve_account_id  # noqa: E402
 
 def check_report_exists():
-    """检查今日日报是否生成"""
+    """检查今日日报是否生成（当前账户）"""
     today = datetime.now(CST).strftime("%Y-%m-%d")
-    report_file = DATA_DIR / f"trend_report_{today}.md"
-    return report_file.exists(), str(report_file)
+    try:
+        aid = resolve_account_id()
+    except ValueError:
+        aid = "default"
+    report_file = DATA_DIR / f"trend_report_{today}_{aid}.md"
+    legacy = DATA_DIR / f"trend_report_{today}.md"
+    if report_file.exists():
+        return True, str(report_file)
+    if legacy.exists() and aid in ("default",):
+        return True, str(legacy)
+    return False, str(report_file)
 
 def check_account_integrity():
     """检查账户文件完整性"""
-    if not ACCOUNT_FILE.exists():
-        return False, "账户文件不存在"
+    ensure_migrated()
+    account_file = get_account_file()
+    if not account_file.exists():
+        try:
+            aid = resolve_account_id()
+        except ValueError as e:
+            aid = str(e)
+        return False, f"账户文件不存在 ({aid})"
     try:
-        with open(ACCOUNT_FILE) as f:
+        with open(account_file, encoding="utf-8") as f:
             acc = json.load(f)
         required = ["version", "initial_cash", "current_cash", "positions", "market_regime"]
         for key in required:
@@ -43,10 +59,12 @@ def check_account_integrity():
 
 def check_last_snapshot():
     """检查最后快照是否是今天"""
-    if not ACCOUNT_FILE.exists():
+    ensure_migrated()
+    account_file = get_account_file()
+    if not account_file.exists():
         return False, "无账户文件"
     try:
-        with open(ACCOUNT_FILE) as f:
+        with open(account_file, encoding="utf-8") as f:
             acc = json.load(f)
         snapshots = acc.get("daily_snapshots", [])
         if not snapshots:
@@ -60,9 +78,24 @@ def check_last_snapshot():
         return False, "快照读取失败"
 
 def check_cron_jobs():
-    """检查 Cron 任务是否正常运行（通过最后运行时间）"""
-    # 这个需要外部调用，这里只做文件级检查
-    return True, "需外部验证"
+    """检查 Cron 是否已安装，以及今日是否有运行记录"""
+    try:
+        r = subprocess.run(
+            ["python3", str(SCRIPT_DIR / "cron_runner.py"), "--status"],
+            capture_output=True, text=True, timeout=20)
+        data = json.loads(r.stdout.strip()) if r.stdout.strip() else {}
+        installed = data.get("crontab_installed", False)
+        if not installed:
+            return False, "crontab 未安装（运行 cron_runner.py --install-crontab）"
+        runs = sum(int(j.get("runs_today") or 0) for j in data.get("jobs") or [])
+        if data.get("trading_day") and runs == 0:
+            # 交易日但全天还没跑过：仅在 16:00 健康检查时算警告
+            hour = datetime.now(CST).hour
+            if hour >= 16:
+                return False, "交易日无任何 cron 运行记录"
+        return True, f"已安装，今日运行 {runs} 次"
+    except Exception as e:
+        return False, f"cron 状态读取失败: {e}"
 
 def send_alert(subject, body):
     """发送告警邮件"""
@@ -98,10 +131,21 @@ def run_health_check(send_email=False):
     if not snapshot_ok:
         alerts.append(f"⚠️ 快照: {snapshot_detail}")
 
+    # 4. Cron 调度
+    cron_ok, cron_detail = check_cron_jobs()
+    checks.append({"name": "Cron调度", "ok": cron_ok, "detail": cron_detail})
+    if not cron_ok:
+        alerts.append(f"⚠️ Cron: {cron_detail}")
+
     # 汇总
     all_ok = all(c["ok"] for c in checks)
+    try:
+        account_id = resolve_account_id()
+    except ValueError:
+        account_id = None
     result = {
         "status": "ok" if all_ok else "alert",
+        "account_id": account_id,
         "time": now.strftime("%Y-%m-%d %H:%M:%S"),
         "checks": checks,
         "alerts": alerts,
@@ -120,6 +164,11 @@ def run_health_check(send_email=False):
 
 
 if __name__ == "__main__":
+    if "--account" in sys.argv:
+        idx = sys.argv.index("--account")
+        if idx + 1 < len(sys.argv):
+            from account_manager import set_account_context
+            set_account_context(sys.argv[idx + 1])
     send = "--send" in sys.argv
     result = run_health_check(send_email=send)
     print(json.dumps(result, ensure_ascii=False, indent=2))

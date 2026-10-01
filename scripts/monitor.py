@@ -4,7 +4,7 @@
 整合：时间守卫、行情获取、回撤熔断、移动止盈、ATR止损、止盈检查、防踩踏
 v2 新增：
   - 最低持仓天数（2天）：避免盘中噪音扫损
-  - 收盘确认止损：盘中只记录潜在止损，尾盘统一执行
+  - 触及止损线立即卖出（不等尾盘）
   - 最高持仓天数（20天）：未达TP1则强制平仓，释放资金
 输出：NO_REPLY（无操作）或 JSON 报告（有操作/异常需AI介入）
 用法: monitor.py [--mode morning|afternoon|closing]
@@ -16,7 +16,8 @@ from pathlib import Path
 CST = timezone(timedelta(hours=8))
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR.parent / "data"
-ACCOUNT_FILE = DATA_DIR / "trend_account.json"
+sys.path.insert(0, str(SCRIPT_DIR))
+from account_manager import get_account_file, sync_legacy, ensure_migrated, resolve_account_id  # noqa: E402
 
 # === v2 新增配置 ===
 MIN_HOLDING_DAYS = 2    # 最低持仓天数：买入后至少持有2天才检查止损
@@ -40,22 +41,26 @@ def send_alert_email(subject, body):
 sys.path.insert(0, str(SCRIPT_DIR))
 
 def load_account():
-    if not ACCOUNT_FILE.exists():
+    ensure_migrated()
+    path = get_account_file()
+    if not path.exists():
         return None
-    with open(ACCOUNT_FILE) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 def save_account(acc):
     import fcntl
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_file = ACCOUNT_FILE.with_suffix(".tmp")
-    lock_file = ACCOUNT_FILE.with_suffix(".lock")
+    ensure_migrated()
+    path = get_account_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = path.with_suffix(".tmp")
+    lock_file = path.with_suffix(".lock")
     try:
         with open(lock_file, "w") as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
-            with open(tmp_file, "w") as f:
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(acc, f, ensure_ascii=False, indent=2)
-            tmp_file.rename(ACCOUNT_FILE)
+            tmp_file.rename(path)
             fcntl.flock(lf, fcntl.LOCK_UN)
     finally:
         if lock_file.exists():
@@ -63,17 +68,39 @@ def save_account(acc):
                 lock_file.unlink()
             except Exception:
                 pass
-
-def run_script(script, args=None):
-    """运行兄弟脚本，返回 (returncode, stdout_json)"""
-    cmd = ["python3", str(SCRIPT_DIR / script)] + (args or [])
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=30)
-        stdout = r.stdout.decode("utf-8").strip()
+        sync_legacy(resolve_account_id())
+    except ValueError:
+        pass
+
+def _python() -> str:
+    return sys.executable or "python3"
+
+
+def run_script(script, args=None, timeout=30):
+    """运行兄弟脚本，返回 (returncode, stdout_json)。买卖必须带上当前账户。"""
+    args = list(args or [])
+    cmd = [_python(), str(SCRIPT_DIR / script), *args]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    try:
+        aid = resolve_account_id()
+        env["STOCK_ACCOUNT_ID"] = aid
+        if script == "simulate_trend.py" and "--account" not in args:
+            cmd = [_python(), str(SCRIPT_DIR / script), "--account", aid, *args]
+    except ValueError:
+        pass
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, env=env, cwd=str(SCRIPT_DIR.parent),
+        )
+        stdout = (r.stdout or b"").decode("utf-8").strip()
+        stderr = (r.stderr or b"").decode("utf-8", errors="ignore").strip()
         try:
-            return r.returncode, json.loads(stdout)
+            if stdout:
+                return r.returncode, json.loads(stdout)
+            return r.returncode, {"error": stderr[-400:] or "无输出"}
         except json.JSONDecodeError:
-            return r.returncode, stdout
+            return r.returncode, stdout or stderr[-400:] or ""
     except Exception as e:
         return -1, {"error": str(e)}
 
@@ -132,10 +159,19 @@ def check_limit_down(acc, prices):
 
 # === 核心检查逻辑 ===
 
-def check_time_guard():
-    """时间守卫：非交易时段直接退出"""
+def check_time_guard(mode="normal"):
+    """时间守卫：非交易时段直接退出。
+    尾盘任务 cron 在 15:10，落在盘后定价时段，必须放行否则止损永远不执行。
+    """
     from time_guard import check
     tradeable, session, detail = check()
+    if mode == "closing" and session not in ("holiday", "weekend"):
+        now = datetime.now(CST)
+        t = now.hour * 60 + now.minute
+        if session in ("afternoon", "close_auction", "after_hours"):
+            return True, session, detail
+        if 15 * 60 <= t < 15 * 60 + 30:
+            return True, "closing_window", detail
     return tradeable, session, detail
 
 def fetch_prices(positions):
@@ -148,12 +184,20 @@ def fetch_prices(positions):
         prefix = "sh" if c.startswith("6") else "sz"
         market_codes.append(f"{prefix}{c}")
     rc, data = run_script("batch_query.py", market_codes)
-    if rc != 0 or isinstance(data, str):
+    # rc==2：部分校验失败，仍可能带 data
+    if isinstance(data, dict) and "data" in data and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not isinstance(data, dict) or isinstance(data, str):
+        return {}
+    if rc not in (0, 2) and not data:
         return {}
     result = {}
     suspended = []
     for k, v in data.items():
-        pure_code = k.lstrip("shszSHSZ")
+        if k in ("errors", "error", "warning") or not isinstance(v, dict):
+            continue
+        key = str(k)
+        pure_code = key[2:] if key.startswith(("sh", "sz", "SH", "SZ")) else key
         if pure_code in codes:
             if v.get("volume", 0) == 0 and v.get("price", 0) == v.get("pre_close", 0) and v.get("price", 0) > 0:
                 v["_suspended"] = True
@@ -171,10 +215,19 @@ def fetch_index():
     return None
 
 def check_circuit_breaker(acc):
-    """回撤熔断检查（含智能解冻条件）"""
-    from simulate_trend import check_drawdown_circuit_breaker, is_frozen, DRAWDOWN_THRESHOLD
+    """回撤熔断检查。
+    历史峰值回撤≥10% 且仍有持仓 → 触发清仓。
+    已空仓且冻结结束 → 按当前净值重计峰值，避免永久锁死开仓。
+    """
+    from simulate_trend import check_drawdown_circuit_breaker, is_frozen, calc_total_assets
     triggered, drawdown_pct = check_drawdown_circuit_breaker(acc)
     frozen = is_frozen(acc)
+
+    if triggered and not frozen and not (acc.get("positions") or {}):
+        acc["peak_total_assets"] = calc_total_assets(acc)
+        acc["frozen_until"] = None
+        save_account(acc)
+        return False, 0, False
 
     if frozen:
         today = datetime.now(CST).strftime("%Y-%m-%d")
@@ -182,7 +235,6 @@ def check_circuit_breaker(acc):
         if frozen_until and today > frozen_until:
             regime = acc.get("market_regime", {}).get("current", "range")
             if regime == "bear":
-                from simulate_trend import save_account
                 new_frozen = (datetime.now(CST) + timedelta(days=1)).strftime("%Y-%m-%d")
                 acc["frozen_until"] = new_frozen
                 save_account(acc)
@@ -271,13 +323,12 @@ def check_logic_stops(acc, prices):
 
 
 def check_atr_stops(acc, prices, mode="normal"):
-    """ATR 动态止损检查（v2: 含最低持仓天数 + 收盘确认）"""
+    """ATR 动态止损：触及止损线立即卖出（仍受最低持仓天数约束）。"""
     from simulate_trend import calc_dynamic_stop_loss
     params = acc["market_regime"]["params_active"]
     fixed_stop = params.get("stop_loss", -0.07)
     atr_multiplier = params.get("atr_multiplier", 1.5)
     actions = []
-    pending_stops = []  # 盘中记录的潜在止损（收盘确认用）
 
     for code, pos in list(acc["positions"].items()):
         price_data = prices.get(code)
@@ -291,7 +342,6 @@ def check_atr_stops(acc, prices, mode="normal"):
             continue
         profit_pct = (current_price - avg_price) / avg_price
 
-        # v2: 最低持仓天数检查
         buy_date = pos.get("buy_date", pos.get("last_buy_date", ""))
         holding_days = calc_holding_days(buy_date)
         if holding_days < MIN_HOLDING_DAYS:
@@ -311,33 +361,15 @@ def check_atr_stops(acc, prices, mode="normal"):
                 effective_stop = min(fixed_stop, atr_stop)
 
         if profit_pct <= effective_stop:
-            if mode == "closing":
-                # 收盘模式：直接执行
-                actions.append({
-                    "action": "sell",
-                    "code": code,
-                    "name": pos["name"],
-                    "shares": pos["shares"],
-                    "price": current_price,
-                    "reason": "stop_loss",
-                    "detail": f"浮亏 {profit_pct*100:.2f}% 触发止损线 {effective_stop*100:.2f}%",
-                })
-            else:
-                # 盘中模式：记录但不执行（收盘确认）
-                pending_stops.append({
-                    "code": code,
-                    "name": pos["name"],
-                    "profit_pct": round(profit_pct * 100, 2),
-                    "stop_line": round(effective_stop * 100, 2),
-                    "current_price": current_price,
-                })
-
-    if pending_stops:
-        print(json.dumps({
-            "info": f"盘中潜在止损（待收盘确认）",
-            "pending_stops": pending_stops,
-        }, ensure_ascii=False), file=sys.stderr)
-
+            actions.append({
+                "action": "sell",
+                "code": code,
+                "name": pos["name"],
+                "shares": pos["shares"],
+                "price": current_price,
+                "reason": "stop_loss",
+                "detail": f"浮亏 {profit_pct*100:.2f}% 触发止损线 {effective_stop*100:.2f}%",
+            })
     return actions
 
 def check_index_circuit_breaker(index_data):
@@ -469,9 +501,8 @@ def execute_sell(code, shares, price, reason):
 def run_monitor(mode="normal"):
     """盯盘主流程，返回 (need_ai, output)
     v2 mode 含义：
-      - normal: 盘中轻量检查（回撤熔断+指数熔断+防踩踏+止盈），止损仅记录不执行
-      - morning/afternoon: 同 normal
-      - closing: 尾盘完整检查（所有风控 + 最大持仓天数 + 止损执行）
+      - normal/morning/afternoon: 盘中检查（回撤熔断+指数熔断+防踩踏+止盈+触及止损即卖）
+      - closing: 尾盘完整检查（另含最高持仓天数）
     """
     now = datetime.now(CST)
     report = {
@@ -483,7 +514,7 @@ def run_monitor(mode="normal"):
     }
 
     # 1. 时间守卫
-    tradeable, session, detail = check_time_guard()
+    tradeable, session, detail = check_time_guard(mode)
     if not tradeable:
         return False, "NO_REPLY"
 
@@ -494,7 +525,7 @@ def run_monitor(mode="normal"):
 
     # 2.5 同步市场环境（每次盯盘都更新，防止 regime 变化后参数不跟）
     try:
-        rc_regime, regime_data = run_script("market_regime.py")
+        rc_regime, regime_data = run_script("market_regime.py", timeout=90)
         if rc_regime == 0 and isinstance(regime_data, dict) and "regime" in regime_data:
             old_regime = acc.get("market_regime", {}).get("current", "unknown")
             new_regime = regime_data.get("regime", "unknown")
@@ -511,6 +542,15 @@ def run_monitor(mode="normal"):
                 "regime": new_regime,
                 "confidence": regime_data.get("confidence", 0),
                 "params_active": regime_data.get("params_active", {}),
+                "strong_trend": regime_data.get("strong_trend"),
+                "leader_style": regime_data.get("leader_style"),
+                "leader_style_cn": regime_data.get("leader_style_cn"),
+                "leader_style_confidence": regime_data.get("leader_style_confidence"),
+                "board_score": regime_data.get("board_score"),
+                "trend_score": regime_data.get("trend_score"),
+                "leaders": regime_data.get("leaders") or [],
+                "style_reason": regime_data.get("style_reason"),
+                "style_metrics": regime_data.get("style_metrics") or {},
             }
             run_simulate(["update_regime", json.dumps(regime_update, ensure_ascii=False)])
             # 重新加载（update_regime 可能更新了文件）
@@ -527,10 +567,14 @@ def run_monitor(mode="normal"):
     # 4. 回撤熔断（最优先，任何模式都执行）
     triggered, drawdown_pct, frozen = check_circuit_breaker(acc)
     if triggered:
+        from simulate_trend import arm_drawdown_freeze
+        freeze_until = arm_drawdown_freeze(acc)
+        save_account(acc)
         report["alerts"].append({
             "type": "drawdown_circuit_breaker",
             "drawdown_pct": f"{drawdown_pct*100:.2f}%",
             "action": "清仓所有非T+1持仓",
+            "frozen_until": freeze_until,
         })
         today = now.strftime("%Y-%m-%d")
         for code, pos in list(acc["positions"].items()):
@@ -548,7 +592,7 @@ def run_monitor(mode="normal"):
             f"回撤熔断已触发！\n"
             f"回撤幅度：{drawdown_pct*100:.2f}%\n"
             f"操作：已清仓所有非T+1持仓\n"
-            f"冻结期：3个交易日\n"
+            f"冻结期：至 {freeze_until}\n"
             f"时间：{now.strftime('%H:%M:%S')}"
         )
         report["need_ai"] = True
@@ -642,7 +686,7 @@ def run_monitor(mode="normal"):
             f"时间：{now.strftime('%H:%M:%S')}"
         )
 
-    # 9. ATR 止损（v2: 盘中仅记录，收盘确认执行）
+    # 9. ATR 止损：触及止损线立即卖出
     atr_actions = check_atr_stops(acc, prices, mode)
     for act in atr_actions:
         rc, data = execute_sell(act["code"], act["shares"], act["price"], act["reason"])
@@ -717,6 +761,12 @@ def run_monitor(mode="normal"):
 
 if __name__ == "__main__":
     mode = "normal"
+    # 支持 --account <id>（同时写入环境变量供账户读写）
+    if "--account" in sys.argv:
+        idx = sys.argv.index("--account")
+        if idx + 1 < len(sys.argv):
+            from account_manager import set_account_context
+            set_account_context(sys.argv[idx + 1])
     if "--mode" in sys.argv:
         idx = sys.argv.index("--mode")
         if idx + 1 in range(len(sys.argv)):

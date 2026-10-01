@@ -13,6 +13,10 @@ data/trend_report_*.md
 data/backtest_stderr*.log
 data/debate_*
 data/test_*
+data/cron_status.json
+data/open_candidates_*.json
+data/accounts_registry.json
+data/accounts/
 
 # Config (keep example, ignore real credentials)
 config/smtp.env

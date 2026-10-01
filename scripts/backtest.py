@@ -538,6 +538,10 @@ class BacktestEngine:
             "002475", "002410", "600588", "300496", "002236",
             "300750", "002594", "300124", "002008", "601100",
             "300586", "300033", "002371", "603986", "002049",
+            # 光
+            "300308", "601869", "603083", "002281", "300394",
+            "600522", "600487", "688313", "600498", "002491",
+            "600105", "300570", "000988", "300620", "002222",
             # 军工
             "600893", "601989", "000768", "600760", "002179",
             # 化工材料
@@ -657,6 +661,8 @@ class BacktestEngine:
             "realized_profit": round(self.stats["total_profit"], 2),
             "stop_loss_count": self.stats["stop_loss_count"],
             "trailing_stop_count": self.stats["trailing_stop_count"],
+            "daily_snapshots": self.daily_snapshots,
+            "trades": self.trade_history,
         }
 
         # 输出报告
